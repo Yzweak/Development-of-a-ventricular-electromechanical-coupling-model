@@ -1,0 +1,1186 @@
+# @Author: charlesmann
+# @Date:   2021-09-20T19:22:52-04:00
+# @Last modified by:   charlesmann
+# @Last modified time: 2022-01-11T17:11:57-05:00
+
+
+
+from __future__ import division
+import sys
+sys.path.append("/home/fenics/shared/GPC-Myosim/dependencies/")
+sys.path.append("/home/fenics/shared/GPC-Myosim/source_code/")
+import os as os
+from dolfin import *
+import numpy as np
+from forms import Forms
+from nsolver import NSolver as NSolver
+import math
+import Python_MyoSim.half_sarcomere.half_sarcomere as half_sarcomere
+import Python_MyoSim.half_sarcomere.implement as implement
+from cell_ion_module import cell_ion_driver
+from edgetypebc import *
+import pandas as pd
+import copy
+from mpi4py import MPI
+from methods import mesh_import
+from methods import local_project
+from methods.mesh_import import mesh_import as mesh_import
+from methods.assign_initial_hsl import assign_initial_hsl as assign_hsl
+from methods.assign_local_coordinate_system import assign_local_coordinate_system as lcs
+from methods.assign_heterogeneous_params import assign_heterogeneous_params as assign_params
+from methods.assign_heterogeneous_params import initialize_dolfin_functions as initialize_dolfin_functions
+from methods.set_boundary_conditions import set_bcs as set_bcs
+from methods.circulatory_module import circulatory_module as cm
+from methods.update_boundary_conditions import update_boundary_conditions
+from methods.save_solution import save_solution
+from methods.load_solution import load_solution as load_sol
+from methods.grow_mesh import grow_mesh
+import recode_dictionary
+import json
+import timeit
+import scipy.interpolate as interpol
+
+# f=open("myprint.txt","w+")
+# sys.stdout=f
+
+def fenics(sim_params):
+    # declare these as indices for things like as_tensor()
+    i,j = indices(2)
+    m,k = indices(2)
+    ## Assign simulation parameters
+    sim_geometry = sim_params["simulation_geometry"][0] #unit_cube, cylinder, ventricle
+    if sim_geometry == "unit_cube":
+        geo_options = {}
+        geo_options["end_x"] = [1.0]
+    else:
+        geo_options = sim_params["geometry_options"]
+
+    sim_protocol = sim_params["protocol"] # contains simulation dependent options
+
+    sim_timestep = sim_protocol["simulation_timestep"][0]
+    sim_duration = sim_protocol["simulation_duration"][0] # can be overwritten in ventricle protocol once number of cycles and heartrate specified
+    no_of_time_steps = int(sim_duration/sim_timestep)
+    t = np.linspace(0,sim_duration,no_of_time_steps)
+    save_cell_output = sim_params["save_cell_output"][0] # myosim output
+    save_visual_output = sim_params["save_visual_output"][0] # paraview files for visualization
+    if "load_solution" in sim_params.keys():
+	load_solution = sim_params["load_solution"][0]
+	load_solution_dir = sim_params["load_solution"][1]
+    else:
+	load_solution = 0
+    if "save_solution" in sim_params.keys():
+	save_solution_flag = sim_params["save_solution"][0]
+    else:
+	save_solution_flag = 0
+    output_path = sim_params["output_path"][0]
+    print "output path,",output_path
+    # assign amount of random variation in f0 (cube and cylinder simulations, 0 means normal alignment)
+    gaussian_width = sim_params["fiber_orientation"]["fiber_randomness"][0]
+
+    # growth parameters
+    #if 'growth_params' in locals():
+    #print "ASSIGNING GROWTH PARAMS"
+    if "save_fx_only" in sim_params.keys():
+        save_fx_only = sim_params["save_fx_only"][0]
+    else:
+        save_fx_only = 0
+    if 'growth_params' in globals():
+        if "eccentric_growth" in growth_params.keys():
+            ecc_growth_rate = growth_params["eccentric_growth"]["time_constant"][0]
+            set_point = growth_params["eccentric_growth"]["passive_set_point"][0]
+            k_myo_damp = Constant(growth_params["eccentric_growth"]["k_myo_damp"][0])
+        if "fiber_reorientation" in growth_params.keys():
+            ordering_law = growth_params["fiber_reorientation"]["law"][0]
+            kroon_time_constant = growth_params["fiber_reorientation"]["time_constant"][0]
+            reorient_start_time = growth_params["fiber_reorientation"]["reorient_t_start"][0]
+            stress_name = growth_params["fiber_reorientation"]["stress_type"][0]
+            #print "reorient start timestep", float(reorient_start_time)/float(sim_timestep)+1
+            #print "loaded growth params"
+    else:
+        k_myo_damp = 0.0
+
+
+
+
+
+
+
+#------------------------------------------------------------------------------
+#           Initialize myosim info for active stress calculation
+#------------------------------------------------------------------------------
+
+    no_of_states = hs_params["myofilament_parameters"]["num_states"][0]
+    no_of_attached_states = hs_params["myofilament_parameters"]["num_attached_states"][0]
+    no_of_transitions = hs_params["myofilament_parameters"]["num_transitions"][0]
+    f01 = float(hs_params["myofilament_parameters"]["f01"][0])
+    f12 = float(hs_params["myofilament_parameters"]["f12"][0])
+    f23 = float(hs_params["myofilament_parameters"]["f23"][0])
+    N0 = float(hs_params["myofilament_parameters"]["N0"][0])
+    N1 = float(hs_params["myofilament_parameters"]["N1"][0])
+    P0 = float(hs_params["myofilament_parameters"]["P0"][0])
+    P1 = float(hs_params["myofilament_parameters"]["P1"][0])
+    P2 = float(hs_params["myofilament_parameters"]["P2"][0])
+    P3 = float(hs_params["myofilament_parameters"]["P3"][0])
+    kon = float(hs_params["myofilament_parameters"]["kon"][0])
+    koff = float(hs_params["myofilament_parameters"]["koff"][0])
+    alpha = float(hs_params["myofilament_parameters"]["alpha"][0])
+    LTRPNCa = float(hs_params["myofilament_parameters"]["LTRPNCa"][0])
+    xfiber_fraction = hs_params["myofilament_parameters"]["xfiber_fraction"][0]
+    n_array_length = no_of_states
+
+# ------------------------------------------------------------------------------
+#          Mesh Information
+# ------------------------------------------------------------------------------
+    # Load in previous solution?
+    if load_solution > 0:
+        expressions_loaded,functions_loaded,wk_params_loaded = load_sol.load_solution(load_solution_dir,sim_geometry,sim_protocol,n_array_length)
+        mesh = functions_loaded["mesh"]
+        facetboundaries = functions_loaded["facetboundaries"]
+        edgeboundaries = functions_loaded["edgeboundaries"]
+        subdomains = functions_loaded["subdomains"]
+    else:
+        mesh,lv_options = mesh_import.import_mesh(sim_geometry, geo_options)
+        facetboundaries = MeshFunction('size_t', mesh, mesh.topology().dim()-1)
+        edgeboundaries = MeshFunction('size_t', mesh, mesh.topology().dim()-2)
+        subdomains = MeshFunction('int', mesh, 3)
+
+    # define communicator, for running with multiple cores in parallel
+    #comm = mesh.mpi_comm()
+    comm = MPI.COMM_WORLD
+
+    no_of_cells = len(subdomains.array())
+
+    # from the mesh, define some things
+    if sim_geometry == "cylinder" or sim_geometry == "unit_cube" or sim_geometry == "box_mesh" or sim_geometry == "gmesh_cylinder":
+        local_no_of_int_points = 4 * np.shape(mesh.cells())[0]
+        deg = 2
+        ds = dolfin.ds(subdomain_data = facetboundaries)
+        fx_rxn = np.zeros((no_of_time_steps))
+    else:
+        #ventricle modeling
+        # Kurtis changing this 6/17/21 to test accuracy/time
+        #deg = 4
+        #no_of_int_points = 14 * np.shape(mesh.cells())[0]
+        deg = 2
+        local_no_of_int_points = 4 * np.shape(mesh.cells())[0]
+        #set surface id numbers
+        topid = 4
+        LVendoid = 2
+        epiid = 1
+
+    # sum local number of int points, broadcast to all processes
+    no_of_int_points = comm.bcast(comm.reduce(local_no_of_int_points))
+
+    parameters["form_compiler"]["quadrature_degree"]=deg
+    parameters["form_compiler"]["representation"] = "quadrature"
+
+    N = FacetNormal (mesh)
+    X = SpatialCoordinate (mesh)
+    dx = dolfin.dx(mesh,metadata = {"integration_order":2})
+    isincomp = True
+
+    # periodic boundary condition
+    class PeriodicBoundary(SubDomain):
+        def inside(self, x, on_boundary):
+            tol = 1E-14
+            return on_boundary and abs(x[1]) < tol
+        def map(self, x, y):
+            # map coordinate from x on top to y on bottom
+            y[0] = x[0]
+            y[1] = x[1]-1.0
+            y[2] = x[2]
+
+    pbc = PeriodicBoundary()
+
+#------------------------------------------------------------------------------
+#           Storage data frames
+#------------------------------------------------------------------------------
+
+    ## Create files for saving information if needed.
+    # cell level info is saved through a pandas command later
+    displacement_file = File(output_path + "u_disp.pvd")
+    output_file = XDMFFile(mpi_comm_world(),output_path + "output.xdmf")
+    output_file.parameters.update({"functions_share_mesh": True,"rewrite_function_mesh": False,"flush_output": True})
+
+    fiber_file = XDMFFile(mpi_comm_world(), output_path + "fiber.xdmf")
+    fiber_file.parameters.update({"functions_share_mesh": True, "rewrite_function_mesh": False, "flush_output": True})
+
+    if save_visual_output:
+        # Can visualize pretty much anything. For now, just looking at deformation and the active stress magnitude
+        tensor_file = File(output_path + "active_stress_tensor.pvd")
+        displacement_file = File(output_path + "u_disp.pvd")
+        active_stress_file = File(output_path + "active_stress_magnitude.pvd")
+        hsl_file = File(output_path + "hsl_mesh.pvd")
+        pk2_fiber_passive_file = File(output_path + "pk2_passive_f0.pvd")
+        rxn_force_file = File(output_path + "rxn_force.pvd")
+        # Want to visualize fiber directions through simulation
+        # fiber_file = File(output_path + "f0_vectors.pvd")
+        # sheet_file = File(output_path + "s0_vectors.pvd")
+        # sheet_normal_file = File(output_path+"n0_vectors.pvd")
+        mesh_file = File(output_path + "mesh_growth.pvd")
+        # set up f0 vs time array
+        f0_vs_time_array = np.zeros((no_of_int_points,3,no_of_time_steps))
+        shearfs_vs_time_array = np.zeros((no_of_int_points,no_of_time_steps))
+        shearfn_vs_time_array = np.zeros((no_of_int_points,no_of_time_steps)) 
+
+
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        # initialize a file for pressures and volumes in windkessel
+        if comm.Get_rank() == 0:
+            fdataPV = open(output_path + "PV_.txt", "w", 0)
+
+    if save_cell_output:
+        # storage arrays to print to file
+        # active stress
+        active_stress_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        active_stress_ds = active_stress_ds.transpose()
+
+        # saving f0 vectors
+        f0_components = np.empty((no_of_int_points,3,no_of_time_steps))
+        f0_components[:] = np.NaN
+
+        calcium_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        calcium_ds = calcium_ds.transpose()
+
+        # myosim populations
+        dumped_populations_ds = pd.DataFrame(np.zeros((no_of_int_points,n_array_length)))
+        dumped_populations = np.zeros((no_of_int_points,n_array_length))
+
+        # passive stressed in myofiber
+        p_f_array_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        p_f_array_ds = p_f_array_ds.transpose()
+
+        # guccione bulk passive stress in fiber direction
+        pgf_array_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        pgf_array_ds = pgf_array_ds.transpose()
+
+        # guccione bulk passive stress in transverse directions
+        pgt_array_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        pgt_array_ds = pgt_array_ds.transpose()
+
+        # guccione bulk passive shear stress
+        pgs_array_ds =pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        pgs_array_ds = pgs_array_ds.transpose()
+
+        # thick and thin filament overlaps
+        temp_overlap_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        temp_overlap_ds = temp_overlap_ds.transpose()
+
+        # stretch
+        alpha_array_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        alpha_array_ds = alpha_array_ds.transpose()
+
+        # half-sarcomere length
+        hsl_array_ds =pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        hsl_array_ds = hsl_array_ds.transpose()
+
+        # change in half-sarcomere length
+        delta_hsl_array_ds = pd.DataFrame(np.zeros(no_of_int_points),index=None)
+        delta_hsl_array_ds = delta_hsl_array_ds.transpose()
+
+    # Initialize some data holders that are necessary
+    temp_overlap = np.zeros((no_of_int_points))
+    calcium = np.zeros(no_of_time_steps)
+    rxn_force = np.zeros(no_of_time_steps+21)
+    avg_fdiff_x_array = np.zeros(no_of_time_steps)
+    avg_fdiff_y_array = np.zeros(no_of_time_steps)
+    avg_fdiff_z_array = np.zeros(no_of_time_steps)
+    reorient_finish_array = np.zeros(no_of_time_steps)
+    avg_fdiff_norm_array = np.zeros(no_of_time_steps)
+    delta_hsl_array = np.zeros(no_of_int_points)
+    traction_switch_flag = 0
+
+
+    #--------------------------------
+    # initialize LV cavity volume, only updated if windkessel is called
+    if load_solution > 0:
+        LVCavityvol = expressions_loaded["LVCavityvol"]
+        u_D = expressions_loaded["u_D"]
+        u_top = expressions_loaded["u_top"]
+        u_front = expressions_loaded["u_front"]
+        Press = expressions_loaded["Press"]
+    else:
+        LVCavityvol = Expression(("vol"), vol=0.0, degree=2)
+        # displacement boundary expression for end of cell or fiber sims
+        u_D = Expression(("u_D"), u_D = 0.0, degree = 0)
+        # Forcing volume preserving for biaxial case
+        u_top = Expression(("u_top"), u_top = 0.0, degree = 0)
+        u_front = Expression(("u_front"), u_front = 0.0, degree = 0)
+        # traction boundary condition for end of cell/fiber, could use this to apply a traction to epicardium or something
+        Press = Expression(("P"), P=0.0, degree=0)
+
+    sim_protocol["start_diastolic_pressure"] = Press.P
+
+    end_systole = 0
+    end_diastole = 0
+
+
+    expressions = {
+        "u_D":u_D,
+        "u_top":u_top,
+        "u_front":u_front,
+        "Press":Press
+    }
+
+    if sim_protocol["simulation_type"][0] == "custom":
+        custom_disp_array = np.load("./custom_displacement.npy")
+    else:
+        custom_disp_array = []
+
+#-------------------------------------------------------------------------------
+#           Initialize finite elements and function spaces
+#-------------------------------------------------------------------------------
+    # Vector element at gauss points (for fibers)
+    VQuadelem = VectorElement("Quadrature", mesh.ufl_cell(), degree=deg, quad_scheme="default")
+    VQuadelem._quad_scheme = 'default'
+
+    # General quadrature element whose points we will evaluate myosim at
+    Quadelem = FiniteElement("Quadrature", tetrahedron, degree=deg, quad_scheme="default")
+    Quadelem._quad_scheme = 'default'
+
+    # Vector element for displacement
+    Velem = VectorElement("CG", mesh.ufl_cell(), 2, quad_scheme="default")
+    Velem._quad_scheme = 'default'
+
+    # Quadrature element for pressure
+    Qelem = FiniteElement("CG", mesh.ufl_cell(), 1, quad_scheme="default")
+    Qelem._quad_scheme = 'default'
+
+    # Real element for rigid body motion boundary condition
+    Relem = FiniteElement("Real", mesh.ufl_cell(), 0, quad_scheme="default")
+    Relem._quad_scheme = 'default'
+
+    Telem2 = TensorElement("Quadrature", mesh.ufl_cell(), degree=deg, shape=2*(3,), quad_scheme='default')
+    Telem2._quad_scheme = 'default'
+    for e in Telem2.sub_elements():
+    	e._quad_scheme = 'default'
+
+    # Mixed element for rigid body motion. One each for x, y displacement. One each for
+    # x, y, z rotation
+    VRelem = MixedElement([Relem, Relem, Relem, Relem, Relem])
+
+
+    # ------- Define function spaces on mesh using above elements --------------
+    # Quadrature space for information needed at gauss points, such as hsl, cb_force, passive forces, etc.
+    Quad = FunctionSpace(mesh, Quadelem)
+    # go ahead and get coordinates of quadrature points
+    gdim = mesh.geometry().dim()
+    xq = Quad.tabulate_dof_coordinates().reshape((-1,gdim))
+    np.save(output_path + 'quadrature_dof',xq)
+    geo_options["xq"] = xq
+
+    # Function space for myosim populations
+    Quad_vectorized_Fspace = FunctionSpace(mesh, MixedElement(n_array_length*[Quadelem]))
+
+    # Function space for local coordinate system (fiber, sheet, sheet-normal)
+    fiberFS = FunctionSpace(mesh, VQuadelem)
+
+    # Tensor function space
+    TF = TensorFunctionSpace(mesh, 'DG', 1)
+    TFQuad = FunctionSpace(mesh, Telem2)
+    TF_kroon = TensorFunctionSpace(mesh,'DG',1)
+
+    # Initializing functions to hold growth stimuli
+    if load_solution > 0:
+        concentric_growth_stimulus = functions_loaded["concentric_growth_stimulus"]
+        eccentric_growth_stimulus = functions_loaded["eccentric_growth_stimulus"]
+        W = functions_loaded["W"]
+        x_dofs = W.sub(0).sub(0).dofmap().dofs() # will use this for x rxn forces later
+    else:
+        concentric_growth_stimulus = Function(FunctionSpace(mesh, "DG",1))
+        eccentric_growth_stimulus = Function(FunctionSpace(mesh,"DG",1))
+        if sim_geometry == "cylinder" or sim_geometry == "unit_cube" or sim_geometry == "box_mesh" or sim_geometry == "gmesh_cylinder":
+            if sim_protocol["simulation_type"][0] == "ramp_and_hold_simple_shear":
+                print "implementing periodic boundary condition"
+                W = FunctionSpace(mesh, MixedElement([Velem,Qelem]),constrained_domain=PeriodicBoundary())
+            else:
+                W = FunctionSpace(mesh, MixedElement([Velem,Qelem]))
+        else:
+            W = FunctionSpace(mesh, MixedElement([Velem,Qelem,Relem,VRelem]))
+
+    # Need dof for CG2 vector space
+    V2 = VectorFunctionSpace(mesh,"CG",2)
+    dm_u = V2.dofmap()
+    local_range_u = dm_u.ownership_range()
+    local_dim_u = local_range_u[1]-local_range_u[0]
+    x_dofs = W.sub(0).sub(0).dofmap().dofs()
+
+    marker_space = FunctionSpace(mesh, 'CG', 1)
+
+#-------------------------------------------------------------------------------
+#           Initialize functions on the above spaces
+#-------------------------------------------------------------------------------
+    # fiber, sheet, and sheet-normal functions
+    if load_solution > 0:
+        f0 = functions_loaded["f0"]
+        s0 = functions_loaded["s0"]
+        n0 = functions_loaded["n0"]
+    else:
+        f0 = Function(fiberFS)
+        s0 = Function(fiberFS)
+        n0 = Function(fiberFS)
+
+    # let's figure out messing with functions with mpi
+    x_dir = Function(VectorFunctionSpace(mesh,"CG",1))
+    x_vec = Function(fiberFS)
+
+    # Trying to loop through and set x_dir function, make it work in parallel
+    V1 = VectorFunctionSpace(mesh,"CG",1) # what x_dir belongs to
+    dm  = V1.dofmap()
+    local_range = dm.ownership_range()
+    local_dim = local_range[1]-local_range[0]
+    dm_yv = Quad_vectorized_Fspace.dofmap()
+    local_range_yv = dm_yv.ownership_range()
+    local_dim_yv = local_range_yv[1]-local_range_yv[0]
+    
+    # local_dim is divisible by 3 because it's a 3 dim vector space
+    # Kurtis, you'll have to create an array of the appropriate size and then set_local
+    array_to_set = np.zeros(local_dim)
+    for jj in np.arange(int(local_dim/3)):
+        array_to_set[jj*3] = 1.0
+        array_to_set[jj*3+1] = 0.0
+        array_to_set[jj*3+2] = 0.0
+    x_dir.vector().set_local(array_to_set)
+    as_backend_type(x_dir.vector()).update_ghost_values()
+
+    dm_fs = fiberFS.dofmap()
+    local_range_fs = dm_fs.ownership_range()
+    local_dim_fs = local_range_fs[1] - local_range_fs[0]
+    array_to_set_x_vec = np.zeros(local_dim_fs)
+    for jj in np.arange(int(local_dim_fs/3)):
+        array_to_set_x_vec[jj*3] = 1.
+        array_to_set_x_vec[jj*3+1] = 0.
+        array_to_set_x_vec[jj*3+2] = 0.
+    x_vec.vector().set_local(array_to_set_x_vec)
+    as_backend_type(x_vec.vector()).update_ghost_values()
+
+
+    # put these in a dictionary to pass to function for assignment
+    coord_params = {
+        "f0":f0,
+        "s0":s0,
+        "n0":n0,
+        "fiberFS":fiberFS,
+        "marker_space":marker_space,
+        "sim_geometry":sim_geometry,
+        "mesh":mesh,
+        "Quad":Quad,
+        "no_of_int_points":no_of_int_points,
+        "geo_options":geo_options,
+        "facetboundaries":facetboundaries,
+        "edgeboundaries":edgeboundaries
+    }
+
+    # create lists of dictionaries that hold parameters for each gauss point
+    # These will remain scalars. I anticipate this will be the case for
+    # any parameters that will be passed into existing modules (myosim parameters,
+    # possible calcium models, etc)
+    hs_params_list = [{}]*no_of_int_points
+    #passive_params_list = [{}]*no_of_int_points
+    # Must make a deep copy so each item in the list is independent, and not linked
+    # to the original paramter dictionary
+    for jj in np.arange(np.shape(hs_params_list)[0]):
+        hs_params_list[jj] = copy.deepcopy(hs_params) # because this is a copy, everything is initialized
+        #passive_params_list[jj] = copy.deepcopy(passive_params)
+
+    # create dictionary of parameters that will be initialized as dolfin functions
+    # (anything used by dolfin in calculations will become a function, ex. passive SEF
+    # or active stress calculation).
+    # dolfin_functions is a nested dictionary
+    dolfin_functions = {}
+    dolfin_functions["passive_params"] = passive_params
+    dolfin_functions["cb_number_density"] = hs_params["cb_number_density"]
+
+    if (sim_geometry == "gmesh_cylinder"):
+        dolfin_functions = initialize_dolfin_functions.initialize_dolfin_functions(dolfin_functions,Quad)
+    else:
+        dolfin_functions = initialize_dolfin_functions.initialize_dolfin_functions(dolfin_functions,Quad)
+
+
+    # functions for the weak form
+    if load_solution > 0:
+        w = functions_loaded["w"]
+    else:
+        w = Function(W)
+
+    dw    = TrialFunction(W)
+    wtest = TestFunction(W)
+
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        # Need the pressure function
+        du,dp,dpendo,dc11 = TrialFunctions(W)
+        (u,p,pendo,c11)   = split(w)
+        (v,q,qendo,v11)   = TestFunctions(W)
+        ventricle_params  = {
+            "lv_volconst_variable": pendo,
+            "lv_constrained_vol":LVCavityvol,
+            "LVendoid": LVendoid,
+            "LVendo_comp": 2,
+        }
+
+    else:
+        du,dp = TrialFunctions(W)
+        #(u,p,c11) = split(w)
+        (u,p) = split(w)
+        #(v,q,v11) = TestFunctions(W)
+        (v,q) = TestFunctions(W)
+
+    # Initial and previous timestep half-sarcomere length functions
+    if load_solution > 0:
+        hsl0 = functions_loaded["hsl0"]
+        y_vec = functions_loaded["y_vec"]
+    else:
+        hsl0    = Function(Quad)
+        y_vec = Function(Quad_vectorized_Fspace)
+        hsl0 = assign_hsl.assign_initial_hsl(lv_options,hs_params,sim_geometry,hsl0)
+        f0,s0,n0,geo_options = lcs.assign_local_coordinate_system(lv_options,coord_params,sim_params)
+    hsl_old = Function(Quad)
+    y_vec_array_new = y_vec.vector().get_local()[:]
+    y_interp = np.zeros(np.shape(y_vec_array_new))
+    # save array of f0
+    # f0_array = project(f0,fiberFS).vector().get_local()[:]
+    # f0_array.reshape((int(local_dim_fs/3),3))
+    # f0_array1 = np.reshape(f0_array,(int(local_dim_fs/3),3))
+    # f0_array_global = comm.gather(f0_array)
+    # if comm.Get_rank() == 0:
+    #     f0_array_global = np.concatenate(f0_array_global).ravel()
+    #     np.save(output_path+'f0_array_global.npy',f0_array_global)
+    #     print "F0 GLOBAL",f0_array_global
+         
+    #np.save(output_path+'f0_array.npy',f0_array)
+
+    # Defining functions to calculate how far hsl is from reference, to be used
+    # to get back to reference length over time
+    pseudo_alpha = Function(Quad)
+    pseudo_old = Function(Quad)
+    pseudo_old.vector()[:] = 1.0
+    hsl_diff_from_reference = Function(Quad)
+    hsl_diff_from_reference.vector()[:] = 0.0
+
+    # Population solution holder for myosim, allows active stress to be calculated
+    # and adjusted as the Newton Solver tries new displacements
+
+    y_vec_array = y_vec.vector().get_local()[:]
+
+#-------------------------------------------------------------------------------
+#           Assign function values
+#-------------------------------------------------------------------------------
+    # f0_dot_x_vec = inner(f0,x_vec)
+    # f0_dot_xvec_array = project(f0_dot_x_vec,Quad).vector().get_local()[:]
+    # angles_array = np.arccos(f0_dot_xvec_array)
+    # np.save(output_path+"angles_array.npy",angles_array)
+    # f0_array = project(f0,fiberFS).vector().get_local()[:]
+    # x_vec_array = x_vec.vector().get_local()[:]
+    # np.save(output_path+"f0_array.npy",f0_array)
+    # np.save(output_path+"x_vec_array.npy",x_vec_array)
+
+    # Assign the heterogeneous parameters
+    #heterogeneous_fcn_list,hs_params_list,passive_params_list = assign_params.assign_heterogeneous_params(sim_params,hs_params_list,passive_params_list,geo_options,heterogeneous_fcn_list,no_of_int_points)
+    hs_params_list,dolfin_functions = assign_params.assign_heterogeneous_params(sim_params,hs_params,hs_params_list,dolfin_functions,geo_options,no_of_int_points,no_of_cells)
+
+    # Select fibers for visualization (exclude stiff regions)
+    binary_mask = np.zeros((no_of_int_points),dtype=int)
+    #print 'binary_mask vs c_param length: ', str(len(binary_mask)) + '/'+ str(len(dolfin_functions["passive_params"]["c"][-1].vector().get_local()))
+    """for jj in np.arange(no_of_cells):
+        hetero_c_param = dolfin_functions["passive_params"]["c"][-1].vector().get_local()[jj]
+        original_c_param = float(passive_params["c"][0])
+        if hetero_c_param != original_c_param:
+            binary_mask[jj*4:jj*4+4] = 1"""
+
+    #print 'first for c_param and binary mask: ', str(dolfin_functions["passive_params"]["c"][-1].vector().get_local()[0]) + '/' + str(binary_mask[:4])
+
+    temp_fcn_visualization = Function(Quad)
+    dm_quad = Quad.dofmap()
+    local_range_quad = dm_quad.ownership_range()
+    local_dim_quad = local_range_quad[1] - local_range_quad[0]
+    temp_assign_array = np.zeros(local_dim_quad)
+    for mm in np.arange(local_dim_quad):
+        temp_assign_array[mm] = hs_params_list[mm]["myofilament_parameters"]["k_force"][0]
+
+    temp_fcn_visualization.vector().set_local(temp_assign_array)
+    as_backend_type(temp_fcn_visualization.vector()).update_ghost_values()
+    File(output_path + "k_force.pvd") << project(temp_fcn_visualization,FunctionSpace(mesh,"DG",0))
+    File(output_path + "c_param.pvd") << project(dolfin_functions["passive_params"]["c"][-1],FunctionSpace(mesh,"DG",0))
+    File(output_path + "cb_density.pvd") << project(dolfin_functions["cb_number_density"][-1],FunctionSpace(mesh,"DG",0))
+#-------------------------------------------------------------------------------
+#           Save initial values
+#-------------------------------------------------------------------------------
+
+    #save initial f0, s0, n0, hsl0
+    if save_visual_output:
+        hsl_temp = project(hsl0,FunctionSpace(mesh,'DG',0))
+        hsl_temp.rename("hsl_temp","half-sarcomere length")
+        hsl_file << hsl_temp
+        output_file.write(hsl_temp,0)
+
+
+#-------------------------------------------------------------------------------
+#           Initialize the solver and forms parameters, continuum tensors
+#-------------------------------------------------------------------------------
+
+    # Initialize growth functions if needed
+
+    # Create growth tensor. Initialized as identity
+    M1ij = project(as_tensor(f0[m]*f0[k], (m,k)),TF)
+    M2ij = project(as_tensor(s0[m]*s0[k], (m,k)),TF)
+    M3ij = project(as_tensor(n0[m]*n0[k], (m,k)),TF)
+
+    Theta1 = Function(FunctionSpace(mesh,"DG",1))
+    Theta1.vector()[:] = 1.0
+
+    Theta2 = Function(FunctionSpace(mesh,"DG",1))
+    Theta2.vector()[:] = 1.0
+
+    Theta3 = Function(FunctionSpace(mesh,"DG",1))
+    Theta3.vector()[:] = 1.0
+
+    # Based on the material coordinates, we can define different Growth Tensor Construct
+    Fg = Theta1*(M1ij) +  Theta2*M2ij + Theta3*M3ij #always created, only updated if growth
+
+
+    # parameters for forms file
+    params= {"mesh": mesh,
+             "facetboundaries": facetboundaries,
+             "facet_normal": N,
+             "mixedfunctionspace": W,
+             "mixedfunction": w,
+             "displacement_variable": u,
+             "pressure_variable": p,
+             "fiber": f0,
+             "sheet": s0,
+             "sheet-normal": n0,
+             "incompressible": isincomp,
+             "hsl0": hsl0,
+             "Kappa":Constant(1e5),
+             "growth_tensor": Fg,
+             "M1": M1ij,
+             "M2": M2ij,
+             "M3": M3ij,
+             "TF": TF}
+
+
+    params.update(dolfin_functions["passive_params"])
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        params.update(ventricle_params)
+
+    # Initialize the forms module
+    uflforms = Forms(params)
+
+    # Get deformation gradient
+    Fmat = uflforms.Fmat()
+    Fe = uflforms.Fe()
+    test_FS = FunctionSpace(mesh,Velem)
+    Fmat2 = Function(TF)
+
+    # Get right cauchy stretch tensor
+    #Cmat = (Fmat.T*Fmat)
+    Cmat = uflforms.Cmat()
+
+    # Get Green strain tensor
+    Emat = uflforms.Emat()
+
+    # jacobian of deformation gradient
+    J = uflforms.J()
+
+    # facet normal in current config
+    n = J*inv(Fmat.T)*N
+
+#-------------------------------------------------------------------------------
+#           Initialize boundary conditions
+#-------------------------------------------------------------------------------
+    # returns a dictionary of bcs and potentially a test_marker_fcn for work loops
+    bc_output = set_bcs.set_bcs(sim_geometry,sim_protocol,geo_options,mesh,W,facetboundaries,expressions)
+    bcs = bc_output["bcs"]
+
+    bcright = bcs[-1]
+    if (sim_protocol["simulation_type"][0] != "cycle"):
+        test_marker_fcn = bc_output["test_marker_fcn"]
+
+
+#-------------------------------------------------------------------------------
+#           Active stress calculation
+#-------------------------------------------------------------------------------
+    # Start with active stress calculation here to validate mmoth_vent, then try to move it to the forms file
+    # Calculate a pseudo stretch, not based on deformation gradient
+    hsl_old.vector()[:] = hsl0.vector()[:]
+    hsl_diff_from_reference = (hsl_old - hsl0)/hsl0
+    pseudo_alpha = pseudo_old*(1.-(k_myo_damp*(hsl_diff_from_reference)))
+    alpha_f = sqrt(dot(f0, Cmat*f0)) # actual stretch based on deformation gradient
+    hsl = pseudo_alpha*alpha_f*hsl0
+    delta_hsl = hsl - hsl_old
+    cb_force = Constant(0.0)
+
+    y_vec_split = split(y_vec)
+    Wp = uflforms.PassiveMatSEF(hsl)
+
+    f01 = 0.15
+    f12 = 0.5
+    f23 = 0.35
+    g01 = 0.1
+    g12 = 0.2
+    g23 = 0.3
+    sumPath = g01 * g12 * g23 + f01 * g12 * g23 + f01 * f12 * g23 + f01 * f12 * f23
+    Pmax1 = (f01 * g12 * g23) / sumPath
+    Pmax2 = (f01 * f12 * g23) / sumPath
+    Pmax3 = (f01 * f12 * f23) / sumPath
+    SL = 2.15
+    if SL < 2.2:
+        alpha_SL = min(1.0, (SL - 2.0 * 1 - 0.1) / (1.5 - 0.1))
+    else:
+        alpha_SL = 1 - (SL - 2.2) / (1.5 - 0.1)
+    factor = 0.1 * alpha_SL / (Pmax1 + 2 * Pmax2 + 3 * Pmax3)
+    hsl_power = 0.5 * delta_hsl + 4.75642
+
+    Force = factor * (y_vec_split[1] + y_vec_split[3] + 2*y_vec_split[4] + 3*y_vec_split[5])
+
+    # xx = [-3, -2, -1, 0, 1, 2, 3]
+    # Force = factor * (y_vec_split[1]*(hsl_power+xx[0]) + y_vec_split[3]*(hsl_power+xx[1]) +
+    #                   y_vec_split[4]*(hsl_power+xx[2]) + y_vec_split[4]*(hsl_power+xx[3]) +
+    #                   y_vec_split[5]*(hsl_power+xx[4]) + y_vec_split[5]*(hsl_power+xx[5]) +
+    #                   y_vec_split[5]*(hsl_power+xx[6]))
+    # cb_force = Force * dolfin_functions["cb_number_density"][-1] * 4.5e-7
+
+    cb_force = Force * dolfin_functions["cb_number_density"][-1] * 8.8e-8#6.8e-8
+    Pactive = cb_force * as_tensor(f0[m]*f0[k], (m,k))+ xfiber_fraction*cb_force * as_tensor(s0[m]*s0[k], (m,k))+ xfiber_fraction*cb_force * as_tensor(n0[m]*n0[k], (m,k))
+    cb_f_array = project(cb_force, Quad).vector().get_local()[:]
+
+#-------------------------------------------------------------------------------
+#           Now hsl function is initiated, make sure all arrays are initialized
+#-------------------------------------------------------------------------------
+    #create hsl_array from projection
+    hsl_array = project(hsl, Quad).vector().get_local()[:]
+
+    if load_solution < 1:
+        #for init_counter in range(0,n_array_length * no_of_int_points,n_array_length):
+        for init_counter in range(0, n_array_length * local_dim_quad,n_array_length):
+            y_vec_array[init_counter] = N0
+            y_vec_array[init_counter + 1] = N1
+            y_vec_array[init_counter + 2] = P0
+            y_vec_array[init_counter + 3] = P1
+            y_vec_array[init_counter + 4] = P2
+            y_vec_array[init_counter + 5] = P3
+            y_vec_array[init_counter + 6] = LTRPNCa
+
+    #Get passive stress tensor, magnitude of myofiber passive stress
+    PK2_passive,Sff = uflforms.stress(hsl)
+
+    # need p_f_array for myosim
+    temp_DG = project(Sff, FunctionSpace(mesh, "DG", 1), form_compiler_parameters={"representation":"uflacs"})
+    p_f = interpolate(temp_DG, Quad)
+    p_f_array = p_f.vector().get_local()[:]
+
+    if load_solution > 0:
+        #print load_sol
+        cb_f_array = expressions_loaded["cb_force_loaded"][:]
+        p_f_array = expressions_loaded["p_force_loaded"]
+
+    F1 = derivative(Wp, w, wtest)*dx
+    # active stress contribution (Pactive is PK2, transform to PK1)
+    F2 = inner(Fmat*Pactive, grad(v))*dx
+
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        print "using F4"
+        # LV volume increase
+        Wvol = uflforms.LVV0constrainedE()
+        F3 = derivative(Wvol, w, wtest)
+        # constrain rigid body motion
+        L4 = inner(as_vector([c11[0], c11[1], 0.0]), u)*dx + \
+    	 inner(as_vector([0.0, 0.0, c11[2]]), cross(X, u))*dx + \
+    	 inner(as_vector([c11[3], 0.0, 0.0]), cross(X, u))*dx + \
+    	 inner(as_vector([0.0, c11[4], 0.0]), cross(X, u))*dx
+
+        F4 = derivative(L4, w, wtest)
+
+        Ftotal = F1 + F2 + F3 + F4
+
+        Jac1 = derivative(F1, w, dw)
+        Jac2 = derivative(F2, w, dw)
+        Jac3 = derivative(F3, w, dw)
+        Jac4 = derivative(F4, w, dw)
+        Jac = Jac1 + Jac2 + Jac3 + Jac4
+    else:
+        F3 = inner(Press*N, v)*ds(2, domain=mesh)
+        # constrain rigid body motion
+        #L4 = inner(as_vector([0.0, 0.0, c11]), u)*dx
+    	 #inner(as_vector([0.0, 0.0, c11[2]]), cross(X, u))*dx + \
+    	 #inner(as_vector([c11[3], 0.0, 0.0]), cross(X, u))*dx + \
+    	 #inner(as_vector([0.0, c11[4], 0.0]), cross(X, u))*dx
+        #F4 = derivative(L4, w, wtest)
+
+        Ftotal = F1 + F2 - F3 #+ F4
+
+        Jac1 = derivative(F1, w, dw)
+        Jac2 = derivative(F2, w, dw)
+        Jac3 = derivative(F3, w, dw)
+        #Jac4 = derivative(F4, w, dw)
+        Jac = Jac1 + Jac2 - Jac3 #+ Jac4
+
+    # Can use Dr. Lee's Nsolver if solver needs debugging
+    solverparams = {"Jacobian": Jac,
+                    "F": Ftotal,
+                    "w": w,
+                    "boundary_conditions": bcs,
+                    "Type": 0,
+                    "mesh": mesh,
+                    "mode": 0
+                    }
+
+    solver= NSolver(solverparams)
+
+#-------------------------------------------------------------------------------
+#           Initial loading (for ventricle)
+#-------------------------------------------------------------------------------
+
+    load_steps = sim_protocol["reference_loading_steps"][0]
+    V_temp = FunctionSpace(mesh, 'DG', 0)
+    v_temp = Function(V_temp)
+    V_temp_array = project(v_temp, V_temp).vector().get_local()[:]
+
+    for i in range(len(V_temp_array)):
+        V_temp_array[i] = -85.8268
+    v_temp.vector().set_local(V_temp_array)
+    as_backend_type(v_temp.vector()).update_ghost_values()
+    # Growing mesh here starting from reference mesh. Hard coded stuff for preliminary sim
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        LVcav_array = np.zeros(no_of_time_steps)
+        LVcav_array[0] = uflforms.LVcavityvol()
+        Pcav_array = np.zeros(no_of_time_steps)
+        Pcav_array[0] = uflforms.LVcavitypressure()*0.0075
+        if load_solution > 0:
+            print "no initial loading of ventricle"
+        else:
+            # Load the ventricle from the reference configuration
+            LVcav_array = np.zeros(no_of_time_steps)
+            LVcav_array[0] = uflforms.LVcavityvol()
+            Pcav_array = np.zeros(no_of_time_steps)
+            Pcav_array[0] = uflforms.LVcavitypressure()*0.0075
+            LVCavityvol.vol = uflforms.LVcavityvol()
+            print "Unloaded LV Cavity Volume = ", LVCavityvol.vol
+            # Calculate the increment to LV volume
+            end_diastolic_volume = sim_protocol["initial_end_diastolic_volume"][0]
+            total_vol_loading = end_diastolic_volume - LVCavityvol.vol
+            volume_increment = total_vol_loading/load_steps
+            for lmbda_value in range(0, load_steps):
+                print "Diastolic loading step " + str(lmbda_value)
+                LVCavityvol.vol += volume_increment
+                p_cav = uflforms.LVcavitypressure()
+                V_cav = uflforms.LVcavityvol()
+                hsl_array_old = hsl_array
+                solve(Ftotal == 0, w, bcs, J = Jac, form_compiler_parameters={"representation":"uflacs"})
+                hsl_array = project(hsl, Quad).vector().get_local()[:]           # for Myosim
+                temp_DG = project(Sff, FunctionSpace(mesh, "DG", 1), form_compiler_parameters={"representation":"uflacs"})
+                p_f = interpolate(temp_DG, Quad)
+                p_f_array = p_f.vector().get_local()[:]
+                for ii in range(np.shape(hsl_array)[0]):
+                    if p_f_array[ii] < 0.0:
+                        p_f_array[ii] = 0.0
+
+                delta_hsl_array = hsl_array - hsl_array_old
+
+                # if comm.Get_rank() == 0:
+                #     print >>fdataPV, 0.1*lmbda_value, p_cav*0.0075 , 0.0, 0.0, V_cav, 0.0, 0.0, 0.0
+                #
+                # if save_visual_output:
+                #     output_file.write(w.sub(0),0.1*lmbda_value)
+                #     pk2temp = project(inner(f0,Pactive*f0),FunctionSpace(mesh,'DG',0),form_compiler_parameters={"representation":"uflacs"})
+                #     output_file.write(pk2temp,0.1*lmbda_value)
+                #     hsl_temp = project(hsl,FunctionSpace(mesh,'DG',0))
+                #     hsl_temp.rename("hsl_temp","half-sarcomere length")
+                #     output_file.write(hsl_temp,0.1*lmbda_value)
+                #     v_temp.rename("volt", "Volt")
+                #     output_file.write(v_temp, 0.1*lmbda_value)
+
+                print("cavity-vol = ", LVCavityvol.vol)
+                print("p_cav = ", uflforms.LVcavitypressure())
+
+#-------------------------------------------------------------------------------
+#           Time Loop
+#-------------------------------------------------------------------------------
+    # Initialize half-sarcomere class. Methods used to calculate cross-bridges
+    # at gauss points
+    hs = half_sarcomere.half_sarcomere(hs_params,1)
+
+    CaList = []
+    with open("/home/fenics/shared/GPC-Myosim/source_code/parameter/ventricle/mix/single_stim/calcium.dat", "r") as f:
+        for i in range(2000):
+            item = f.readline().split('\t')[1:-1]
+            CaList.append(list(map(float, item)))
+
+    VoltList = []
+    with open("/home/fenics/shared/GPC-Myosim/source_code/parameter/ventricle/mix/single_stim/volt.dat", "r") as f:
+        for i in range(2000):
+            item = f.readline().split('\t')[1:-1]
+            VoltList.append(list(map(float, item)))
+
+    # Initialize cell ion module
+    cell_ion = cell_ion_driver.cell_ion_driver(cell_ion_params,sim_timestep,sim_duration)
+    # Initialize calcium concentration from cell_ion module
+    calcium[0] = cell_ion.calculate_concentrations(sim_timestep,0,0)
+
+
+    # Load in circulatory module
+    if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+        windkessel_params["PLV"] = [0.0]
+        windkessel_params["Part"] = [0.0]
+        windkessel_params["Pven"] = [0.0]
+        if load_solution > 0:
+            windkessel_params["V_ven"][0] = wk_params_loaded["V_ven"]
+            windkessel_params["V_art"][0] = wk_params_loaded["V_art"]
+            windkessel_params["Part"][0] = wk_params_loaded["Part"]
+            windkessel_params["Pven"][0] = wk_params_loaded["Pven"]
+            windkessel_params["PLV"][0] = wk_params_loaded["PLV"]
+        circ_model = cm.circ_module(windkessel_params)
+
+
+    for l in np.arange(no_of_time_steps):
+        tic = timeit.default_timer()
+
+        print "Time step number " + str(l)
+        if (sim_geometry == "ventricle") or (sim_geometry == "ellipsoid"):
+            # update calcium
+            # calcium[l] = cell_ion.calculate_concentrations(sim_timestep,t[l],l)
+            calcium[l] = CaList[l][0]
+            # Update circulatory model
+            p_cav = uflforms.LVcavitypressure()
+            V_cav = uflforms.LVcavityvol()
+            print "Volume of LV = ",V_cav
+            circ_dict = circ_model.update_compartments(p_cav,V_cav,sim_timestep)
+            LVCavityvol.vol = circ_dict["V_cav"]
+            LVcav_array[l] = circ_dict["V_cav"]
+            end_systole = circ_dict["end_systole"]
+            end_diastole = circ_dict["end_diastole"]
+            Pcav_array[l] = p_cav*0.0075
+
+            # Now print out volumes, pressures, calcium
+            if comm.Get_rank() == 0:
+                print >>fdataPV, t[l], circ_dict["p_cav"]*0.0075 , circ_dict["Part"]*.0075, circ_dict["Pven"]*.0075, circ_dict["V_cav"], circ_dict["V_ven"], circ_dict["V_art"], calcium[l]
+
+        # At each gauss point, solve for cross-bridge distributions using myosim
+        print "calling myosim"
+        #for mm in np.arange(no_of_int_points):
+        for mm in np.arange(local_dim_quad):
+            temp_overlap[mm], y_interp[mm*n_array_length:(mm+1)*n_array_length], y_vec_array_new[mm*n_array_length:(mm+1)*n_array_length] = implement.update_simulation(hs, sim_timestep, delta_hsl_array[mm], hsl_array[mm], y_vec_array[mm*n_array_length:(mm+1)*n_array_length], p_f_array[mm], cb_f_array[mm], CaList[l][int(mm/4)], n_array_length, t,hs_params_list[mm])
+
+
+        if save_cell_output:
+            for  i in range(no_of_int_points):
+                for j in range(n_array_length):
+                    dumped_populations[i, j] = y_interp[i * n_array_length + j]
+
+        # Update the populations
+        y_vec_array = y_vec_array_new # for Myosim
+
+        # Update the population function for fenics
+        #y_vec.vector()[:] = y_vec_array # for PDE
+        y_vec.vector().set_local(y_vec_array)
+        as_backend_type(y_vec.vector()).update_ghost_values()
+        # Update the array for myosim
+        hsl_array_old = hsl_array
+        # Update the hsl_old function for fenics
+        hsl_old.vector()[:] = hsl_array_old[:]
+
+        temp_DG = project(Sff, FunctionSpace(mesh, "DG", 1), form_compiler_parameters={"representation":"uflacs"})
+        p_f = interpolate(temp_DG, Quad)
+        p_f_array = p_f.vector().get_local()[:]
+
+	try:
+            solve(Ftotal == 0, w, bcs, J = Jac, form_compiler_parameters={"representation":"uflacs"},solver_parameters={"newton_solver":{"relative_tolerance":1e-8},"newton_solver":{"maximum_iterations":50},"newton_solver":{"absolute_tolerance":1e-8}})
+        except:
+            np.save(output_path + 'f0_vs_time.npy',f0_vs_time_array)
+	    f0_dot_x_vec = inner(f0,x_vec)
+	    f0_dot_x_vec_array = project(f0_dot_x_vec,Quad).vector().get_local()[:]
+	    angles_array = np.arccos(f0_dot_x_vec_array)
+	    np.save(output_path+"final_angles_array.npy",angles_array)
+
+
+        #print "PK2"
+        PK2 = project(PK2_passive,TensorFunctionSpace(mesh,"DG",1),form_compiler_parameters={"representation":"uflacs"})
+
+        V0 = FunctionSpace(mesh, 'DG', 0)
+        v0 = Function(V0)
+        V_array = project(v0, V0).vector().get_local()[:]
+
+        for i in range(len(V_array)):
+            V_array[i] = VoltList[l][i]
+        v0.vector().set_local(V_array)
+        as_backend_type(v0.vector()).update_ghost_values()
+
+        #print "cb f array"
+        cb_f_array[:] = project(cb_force, Quad).vector().get_local()[:]
+        if save_visual_output:
+            pk2temp = project(inner(f0,Pactive*f0),FunctionSpace(mesh,'DG',0),form_compiler_parameters={"representation":"uflacs"})
+            pk2temp.rename("pk2_active","active_stress")
+            output_file.write(pk2temp,t[l])
+            v0.rename("volt", "Volt")
+            output_file.write(v0, t[l])
+
+
+        hsl_old.vector()[:] = project(hsl, Quad).vector().get_local()[:] # for PDE
+        pseudo_old.vector()[:] = project(pseudo_alpha, Quad).vector().get_local()[:]
+        hsl_array = project(hsl, Quad).vector().get_local()[:]           # for Myosim
+        delta_hsl_array = project(sqrt(dot(f0, Cmat*f0))*hsl0, Quad).vector().get_local()[:] - hsl_array_old # for Myosim
+
+        temp_DG = project(Sff, FunctionSpace(mesh, "DG", 1), form_compiler_parameters={"representation":"uflacs"})
+        p_f = interpolate(temp_DG, Quad)
+        p_f_array = p_f.vector().get_local()[:]
+
+        for ii in range(np.shape(hsl_array)[0]):
+            if p_f_array[ii] < 0.0:
+                p_f_array[ii] = 0.0
+
+        #print "Kroon"
+        if 'kroon_time_constant' in locals():
+            if stress_name == "passive":
+                driver_type = PK2_passive
+            elif stress_name == "active":
+                driver_type = Pactive
+            elif stress_name == "total":
+                driver_type = PK2_passive + Pactive
+            if ordering_law == "strain_kroon":
+                driver_type = Emat
+            if l > float(reorient_start_time)/float(sim_timestep):
+                print "updating fiber orientation"
+                if ordering_law == "stress_kroon":
+                    fdiff = uflforms.stress_kroon(PK2,Quad,fiberFS,TF_kroon,float(sim_timestep),kroon_time_constant)
+                elif ordering_law == "strain_kroon":
+                    fdiff = uflforms.kroon_law(fiberFS,float(sim_timestep),kroon_time_constant,binary_mask)
+		    f0.vector()[:] += fdiff.vector()[:]
+                elif ordering_law == "new_stress_kroon":
+                    fdiff = uflforms.new_stress_kroon(driver_type,fiberFS,float(sim_timestep),kroon_time_constant,binary_mask)
+		    f0.vector()[:] += fdiff.vector()[:]
+                    print "CHECKING NUMBER OF FIBER VECTORS"
+                    print np.shape(f0.vector().get_local())
+                    print "Fiber orientation updated"
+	        #update fiber orientations
+                s0,n0 = lcs.update_local_coordinate_system(f0,coord_params)
+
+
+        print "updating boundary conditions"
+        # Update boundary conditions/expressions (need to include general displacements and tractions)
+        # quick hack
+        if sim_geometry == "ellipsoid" or sim_geometry == "ventricle":
+            x_dofs = 0.0
+            x_dofs = 0.0
+            test_marker_fcn = 0.0
+            traction_switch_flag = 0.0
+            x_dir = 0.0 # generalize the input to bc_update dict to be a dictionary that is updated as needed
+        bc_update_dict = update_boundary_conditions.update_bcs(bcs,sim_geometry,Ftotal,geo_options,sim_protocol,expressions,t[l],traction_switch_flag,x_dofs,test_marker_fcn,w,mesh,bcright,x_dir,l,W,facetboundaries,custom_disp_array,comm)
+        bcs = bc_update_dict["bcs"]
+
+        if not (sim_geometry == "ventricle" or sim_geometry == "ellipsoid"):
+            traction_switch_flag = bc_update_dict["traction_switch_flag"]
+            print "assigning fxn_force array",bc_update_dict["rxn_force"][0]
+            rxn_force[l] = bc_update_dict["rxn_force"][0]
+            u_D = bc_update_dict["expr"]["u_D"]
+            Press = bc_update_dict["expr"]["Press"]
+            print "current traction: ", Press.P
+
+        if save_visual_output:
+            output_file.write(w.sub(0),t[l])
+            f0_temp = project(f0, VectorFunctionSpace(mesh, "DG", 0))
+            f0_temp.rename('f0', 'f0')
+            fiber_file.write(f0_temp, t[l])
+            s0_temp = project(s0, VectorFunctionSpace(mesh, "DG", 0))
+            s0_temp.rename('s0', 's0')
+            fiber_file.write(s0_temp, t[l])
+            n0_temp = project(n0, VectorFunctionSpace(mesh, "DG", 0))
+            n0_temp.rename('n0', 'n0')
+            fiber_file.write(n0_temp, t[l])
+            if 'kroon_time_constant' in locals():
+                f0_vs_time_temp = project(f0,fiberFS).vector().get_local()[:]
+                f0_vs_time_temp2_global = comm.gather(f0_vs_time_temp)
+                shearfs_temp = project(inner(s0,(PK2_passive +Pactive)*f0),FunctionSpace(mesh,"DG",1),form_compiler_parameters={"representation":"uflacs"})
+                shearfs_quad = interpolate(shearfs_temp,Quad)
+                shearfn_temp = project(inner(n0,(PK2_passive+Pactive)*f0),FunctionSpace(mesh,"DG",1),form_compiler_parameters={"representation":"uflacs"})
+                shearfn_quad = interpolate(shearfn_temp,Quad)
+
+                if comm.Get_rank() == 0:
+                    f0_vs_time_temp2_global = np.concatenate(f0_vs_time_temp2_global).ravel()
+                    f0_vs_time_temp2_global = np.reshape(f0_vs_time_temp2_global,(no_of_int_points,3))
+                    f0_vs_time_array[:,:,l] = f0_vs_time_temp2_global
+                    shearfs_vs_time_array[:,l] = shearfs_quad.vector().get_local()[:]
+                    shearfn_vs_time_array[:,l] = shearfn_quad.vector().get_local()[:]
+
+            hsl_temp = project(hsl,FunctionSpace(mesh,'DG',0))
+            hsl_temp.rename("hsl_temp","half-sarcomere length")
+            output_file.write(hsl_temp,t[l])
+
+        comm.barrier()
+        # Save cell info
+        tic_save_cell = timeit.default_timer()
+        if save_cell_output:
+
+            active_stress_ds.iloc[0,:] = cb_f_array[:]
+            active_stress_ds.to_csv(output_path + 'active_stress.csv',mode='a',header=False)
+
+            #active_stress_ds = active_stress_ds.transpose()
+            hsl_array_ds.iloc[0,:] = hsl_array[:]
+            hsl_array_ds.to_csv(output_path + 'half_sarcomere_lengths.csv',mode='a',header=False)
+
+            # calcium_ds.iloc[0,:] = calcium[l]
+            # calcium_ds.to_csv(output_path + 'calcium.csv',mode='a',header=False)
+
+            # for i in range(no_of_int_points):
+            #     dumped_populations_ds.iloc[i,:] = dumped_populations[i,:]
+            # dumped_populations_ds.to_csv(output_path + 'populations.csv',mode='a',header=False)
+            #
+            # np.save(output_path+"time", t) # fix this
+
+            p_f_array_ds.iloc[0,:] = p_f_array[:]
+            p_f_array_ds.to_csv(output_path + 'myofiber_passive.csv',mode='a',header=False)
+
+            # temp_overlap_ds.iloc[0,:] = temp_overlap[:]
+            # temp_overlap_ds.to_csv(output_path + 'overlap.csv',mode='a',header=False)
+            #
+            delta_hsl_array_ds.iloc[0,:] = delta_hsl_array[:]
+            delta_hsl_array_ds.to_csv(output_path + 'delta_hsl.csv',mode='a',header=False)
+
+        if l == (no_of_time_steps - 1):
+            for i in range(no_of_int_points):
+                dumped_populations_ds.iloc[i,:] = dumped_populations[i,:]
+            dumped_populations_ds.to_csv(output_path + 'populations.csv',mode='a',header=False)
+
+        toc_save_cell = timeit.default_timer() - tic_save_cell
+        toc = timeit.default_timer() - tic
+    if sim_geometry == "ventricle" or sim_geometry == "ellipsoid":
+        print "time loop performance time = " + str(toc)
+        if comm.Get_rank() == 0:
+            fdataPV.close()
+    output_file.close()
+
+    if save_solution_flag > 0:
+        print "Trying to save full solution to load into another simulation"
+        hsl = project(hsl,Quad)
+        save_solution.save_solution(output_path,mesh,f0,n0,s0,facetboundaries,edgeboundaries,subdomains,LVCavityvol,u_D,u_top,u_front,Press,hs_params_list,dolfin_functions,W,w,hsl,y_vec,bcs,concentric_growth_stimulus,eccentric_growth_stimulus,cb_f_array,p_f_array)
+
+#-------------------------------------------------------------------------------
+# for stand-alone testing
+input_file = sys.argv[1]
+#start_time = datetime.datetime.now()
+start = timeit.default_timer()
+# Load in JSON dictionary
+with open(input_file, 'r') as json_input:
+  input_parameters = json.load(json_input)
+
+# Convert any unicode values to python strings so they work with some cpp libraries.
+recode_dictionary.recode(input_parameters)
+
+# Parse out the different types of parameters.
+sim_params = input_parameters["simulation_parameters"]
+passive_params = input_parameters["forms_parameters"]["passive_law_parameters"]
+hs_params = input_parameters["myosim_parameters"]
+cell_ion_params = input_parameters["electrophys_parameters"]["cell_ion_parameters"]
+all_params = [sim_params,passive_params,hs_params,cell_ion_params]
+#monodomain_params = input_parameters["electrophys_parameters"]["monodomain_parameters"]
+if "windkessel_parameters" in input_parameters.keys():
+    windkessel_params = input_parameters["windkessel_parameters"]
+if "growth_and_remodeling" in input_parameters.keys():
+    growth_params = input_parameters["growth_and_remodeling"]
+    if 'growth_params' in locals():
+        all_params.append(growth_params)
+#optimization_params = input_parameters["optimization_parameters"]
+
+fenics(sim_params)
+sim_duration = timeit.default_timer() - start
+print "sim duration =",sim_duration
+#aplog.append_to_log(all_params,start_time,sim_duration,input_file)
